@@ -31,7 +31,18 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <cstddef>
 #include <thread>
 #include <string>
+#include <vector>
 
+typedef struct numa_info {
+    std::vector<randomx_cache*> caches;
+    std::vector<randomx_dataset*> datasets;
+    unsigned cpu_to_node[64];
+    unsigned count;
+} numa_info;
+
+int alloc_numa(numa_info &info, randomx_flags flags);
+int free_numa(numa_info &info);
+unsigned nth_cpu_for_node(numa_info &info, unsigned node, unsigned nth=1);
 int set_thread_affinity(const unsigned &cpuid);
 int set_thread_affinity(std::thread::native_handle_type thread,
         const unsigned &cpuid);

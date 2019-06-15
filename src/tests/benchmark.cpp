@@ -87,6 +87,7 @@ void printUsage(const char* executable) {
 	std::cout << "  --softAes     use software AES (default: hardware AES)" << std::endl;
 	std::cout << "  --threads T   use T threads (default: 1)" << std::endl;
 	std::cout << "  --affinity A  thread affinity bitmask (default: 0)" << std::endl;
+	std::cout << "  --numa        allocation based on detected NUMA nodes mode" << std::endl;
 	std::cout << "  --init Q      initialize dataset with Q threads (default: 1)" << std::endl;
 	std::cout << "  --nonces N    run N nonces (default: 1000)" << std::endl;
 	std::cout << "  --seed S      seed for cache initialization (default: 0)" << std::endl;
@@ -126,8 +127,18 @@ void mine(randomx_vm* vm, std::atomic<uint32_t>& atomicNonce, AtomicHash& result
 	}
 }
 
+void init_dataset(randomx_dataset *dataset, randomx_cache *cache, int startItem, int count, int cpuid=-1) {
+	if (cpuid >= 0) {
+		int rc = set_thread_affinity(cpuid);
+		if (rc) {
+			std::cerr << "Failed to set thread affinity (error=" << rc << ")" <<  std::endl;
+		}
+	}
+	randomx_init_dataset(dataset, cache, startItem, count);
+}
+
 int main(int argc, char** argv) {
-	bool softAes, miningMode, verificationMode, help, largePages, jit, secure;
+	bool softAes, miningMode, verificationMode, help, largePages, jit, secure, numa;
 	int noncesCount, threadCount, initThreadCount;
 	uint64_t threadAffinity;
 	int32_t seedValue;
@@ -146,6 +157,7 @@ int main(int argc, char** argv) {
 		readOption("--largepages", argc, argv, largePages);
 	}
 	readOption("--jit", argc, argv, jit);
+	readOption("--numa", argc, argv, numa);
 	readOption("--help", argc, argv, help);
 	readOption("--secure", argc, argv, secure);
 
@@ -162,8 +174,6 @@ int main(int argc, char** argv) {
 	AtomicHash result;
 	std::vector<randomx_vm*> vms;
 	std::vector<std::thread> threads;
-	randomx_dataset* dataset;
-	randomx_cache* cache;
 	randomx_flags flags = RANDOMX_FLAG_DEFAULT;
 
 	if (miningMode) {
@@ -207,6 +217,20 @@ int main(int argc, char** argv) {
 		std::cout << " - thread affinity (" << mask_to_string(threadAffinity) << ")" << std::endl;
 	}
 
+	numa_info ni;
+	if (numa && miningMode) {
+		std::cout << " - allocation based on NUMA mode" << std::endl;
+		int rc = alloc_numa(ni, flags);
+		if (rc < 0)
+			throw std::runtime_error("NUMA based allocation failed");
+	}
+	else {
+		ni.caches.push_back(randomx_alloc_cache(flags));
+		if (miningMode)
+			ni.datasets.push_back(randomx_alloc_dataset(flags));
+		ni.count = 1;
+	}
+
 	std::cout << "Initializing";
 	if (miningMode)
 		std::cout << " (" << initThreadCount << " thread" << (initThreadCount > 1 ? "s)" : ")");
@@ -221,40 +245,61 @@ int main(int argc, char** argv) {
 		}
 
 		Stopwatch sw(true);
-		cache = randomx_alloc_cache(flags);
-		if (cache == nullptr) {
-			throw CacheAllocException();
-		}
-		randomx_init_cache(cache, &seed, sizeof(seed));
-		if (miningMode) {
-			dataset = randomx_alloc_dataset(flags);
-			if (dataset == nullptr) {
-				throw DatasetAllocException();
-			}
-			uint32_t datasetItemCount = randomx_dataset_item_count();
-			if (initThreadCount > 1) {
-				auto perThread = datasetItemCount / initThreadCount;
-				auto remainder = datasetItemCount % initThreadCount;
-				uint32_t startItem = 0;
-				for (int i = 0; i < initThreadCount; ++i) {
-					auto count = perThread + (i == initThreadCount - 1 ? remainder : 0);
-					threads.push_back(std::thread(&randomx_init_dataset, dataset, cache, startItem, count));
-					startItem += count;
+		for (int n = 0; n < ni.count; n++) {
+			randomx_cache *cache = ni.caches[n];
+			if (cache == nullptr) {
+				if (jit) {
+					throw std::runtime_error("JIT compilation is not supported or cache allocation failed");
 				}
-				for (unsigned i = 0; i < threads.size(); ++i) {
-					threads[i].join();
+				throw std::runtime_error("Cache allocation failed");
+			}
+			randomx_init_cache(cache, &seed, sizeof(seed));
+			if (miningMode) {
+				randomx_dataset *dataset = ni.datasets[n];
+				if (dataset == nullptr) {
+					throw std::runtime_error("Dataset allocation failed");
 				}
+				uint32_t datasetItemCount = randomx_dataset_item_count();
+				if (initThreadCount > 1) {
+					int cpuid = -1;
+					auto perThread = datasetItemCount / initThreadCount;
+					auto remainder = datasetItemCount % initThreadCount;
+					uint32_t startItem = 0;
+					for (int i = 0; i < initThreadCount; ++i) {
+						if (numa) {
+							cpuid = nth_cpu_for_node(ni, n, i+1);
+						}
+						auto count = perThread + (i == initThreadCount - 1 ? remainder : 0);
+						threads.push_back(std::thread(&init_dataset, dataset, cache, startItem, count, cpuid));
+						startItem += count;
+					}
+					for (unsigned i = 0; i < threads.size(); ++i) {
+						threads[i].join();
+					}
+				}
+				else {
+					randomx_init_dataset(dataset, cache, 0, datasetItemCount);
+				}
+				threads.clear();
 			}
-			else {
-				randomx_init_dataset(dataset, cache, 0, datasetItemCount);
-			}
-			randomx_release_cache(cache);
-			cache = nullptr;
-			threads.clear();
 		}
 		std::cout << "Memory initialized in " << sw.getElapsed() << " s" << std::endl;
 		std::cout << "Initializing " << threadCount << " virtual machine(s) ..." << std::endl;
 		for (int i = 0; i < threadCount; ++i) {
+			unsigned cpuid = 0, node = 0;
+			randomx_cache *cache;
+			randomx_dataset *dataset;
+			if (threadAffinity)
+				cpuid = cpuid_from_mask(threadAffinity, i);
+			if (numa)
+				node = ni.cpu_to_node[cpuid];
+			if (miningMode) {
+				cache = ni.caches[node];
+				dataset = ni.datasets[node];
+			}
+			else {
+				cache = ni.caches[0];
+			}
 			randomx_vm *vm = randomx_create_vm(flags, cache, dataset);
 			if (vm == nullptr) {
 				if (!softAes) {
@@ -274,10 +319,7 @@ int main(int argc, char** argv) {
 				int cpuid = -1;
 				if (threadAffinity)
 					cpuid = cpuid_from_mask(threadAffinity, i);
-				if (softAes)
-					threads.push_back(std::thread(&mine, vms[i], std::ref(atomicNonce), std::ref(result), noncesCount, i, cpuid));
-				else
-					threads.push_back(std::thread(&mine, vms[i], std::ref(atomicNonce), std::ref(result), noncesCount, i, cpuid));
+				threads.push_back(std::thread(&mine, vms[i], std::ref(atomicNonce), std::ref(result), noncesCount, i, cpuid));
 			}
 			for (unsigned i = 0; i < threads.size(); ++i) {
 				threads[i].join();
@@ -290,10 +332,7 @@ int main(int argc, char** argv) {
 		double elapsed = sw.getElapsed();
 		for (unsigned i = 0; i < vms.size(); ++i)
 			randomx_destroy_vm(vms[i]);
-		if (miningMode)
-			randomx_release_dataset(dataset);
-		else
-			randomx_release_cache(cache);
+		free_numa(ni);
 		std::cout << "Calculated result: ";
 		result.print(std::cout);
 		if (noncesCount == 1000 && seedValue == 0)

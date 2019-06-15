@@ -30,15 +30,104 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <sstream>
 
 #if defined(_WIN32) || defined(__CYGWIN__)
-  #include <windows.h>
+#include <windows.h>
 #else
-  #ifdef __APPLE__
-    #include <mach/thread_act.h>
-    #include <mach/thread_policy.h>
-  #endif
-  #include <pthread.h>
+#ifdef __APPLE__
+#include <mach/thread_act.h>
+#include <mach/thread_policy.h>
 #endif
+#include <pthread.h>
+#endif
+
+#ifdef HAVE_HWLOC
+#include <hwloc.h>
+#endif
+
+#include "../randomx.h"
+#include "../common.hpp"
 #include "affinity.hpp"
+
+int
+alloc_numa(numa_info &info, randomx_flags flags)
+{
+#ifndef HAVE_HWLOC
+    return -1;
+#else
+    hwloc_topology_t topology;
+    hwloc_obj_t obj;
+    int depth, count;
+    hwloc_topology_init(&topology);
+    hwloc_topology_load(topology);
+    depth = hwloc_get_type_depth(topology, HWLOC_OBJ_NUMANODE);
+    count = hwloc_get_nbobjs_by_depth(topology, depth);
+    info.count = count;
+    int rc;
+    for (int n=0; n<count; n++)
+    {
+        obj = hwloc_get_obj_by_type(topology, HWLOC_OBJ_NUMANODE, n);
+        randomx_cache *c = randomx_alloc_cache(flags);
+        rc = hwloc_set_area_membind_nodeset(topology, c, randomx::CacheSize,
+                obj->nodeset, HWLOC_MEMBIND_BIND, 0);
+        if (rc < 0)
+        {
+            std::cout << "Failed to bind cache: "
+                      << strerror(errno) << std::endl;
+        }
+        info.caches.push_back(c);
+        randomx_dataset *d = randomx_alloc_dataset(flags);
+        rc = hwloc_set_area_membind_nodeset(topology, d, randomx::DatasetSize,
+                obj->nodeset, HWLOC_MEMBIND_BIND, 0);
+        if (rc < 0)
+        {
+            std::cout << "Failed to bind dataset: "
+                      << strerror(errno) << std::endl;
+        }
+        info.datasets.push_back(d);
+    }
+    for (int c=0; c<64; c++)
+    {
+        obj = hwloc_get_obj_by_type(topology, HWLOC_OBJ_PU, c);
+        if (!obj) continue;
+        obj = hwloc_get_ancestor_obj_by_type(topology, HWLOC_OBJ_NUMANODE, obj);
+        if (!obj) continue;
+        info.cpu_to_node[c] = obj->os_index;
+    }
+    hwloc_topology_destroy(topology);
+    return count;
+#endif
+}
+
+int
+free_numa(numa_info &info)
+{
+    for (auto cache : info.caches)
+        randomx_release_cache(cache);
+    for (auto dataset : info.datasets)
+        randomx_release_dataset(dataset);
+    info.caches.clear();
+    info.datasets.clear();
+    info.count = 0;
+    return 0;
+}
+
+unsigned
+nth_cpu_for_node(numa_info &info, unsigned node, unsigned nth/*=1*/)
+{
+    unsigned *start = &info.cpu_to_node[0];
+    unsigned *end = start + 64;
+    unsigned *p = start;
+    unsigned count = 0;
+    while (p < end)
+    {
+        if (*p == node)
+        {
+            if (++count == nth)
+                return p - start;
+        }
+        p++;
+    }
+    return 0;
+}
 
 int
 set_thread_affinity(const unsigned &cpuid)

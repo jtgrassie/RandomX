@@ -152,12 +152,25 @@ if (NOT Threads_FOUND AND UNIX AND NOT APPLE)
   find_package(Threads)
 endif()
 
+find_package(PkgConfig)
+if (PkgConfig_FOUND)
+  pkg_check_modules(HWLOC IMPORTED_TARGET hwloc)
+  if (HWLOC_FOUND)
+    add_definitions(-DHAVE_HWLOC)
+    include_directories(${HWLOC_INCLUDE_DIRS})
+    link_directories(${HWLOC_LIBRARY_DIRS})
+  endif()
+endif()
+
 add_executable(randomx-benchmark
   src/tests/benchmark.cpp
   src/tests/affinity.cpp)
+
 target_link_libraries(randomx-benchmark
-  PRIVATE randomx
-  PRIVATE ${CMAKE_THREAD_LIBS_INIT})
+  PRIVATE
+    randomx
+    ${CMAKE_THREAD_LIBS_INIT}
+    ${HWLOC_LIBRARIES})
 
 include(CheckCXXSourceCompiles)
 check_cxx_source_compiles("
